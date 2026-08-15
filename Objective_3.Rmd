@@ -1,0 +1,325 @@
+---
+title: "Pangolin Wildlife Trade Spatial Modeling - Gabon"
+subtitle: "Objective 3: Random Forest Model Evaluation and Feature Importance Analysis"
+author: "Elda Yitbarek Bezuayene"
+date: "`r Sys.Date()`"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+1. Setup, File Existence Check, and Raster Stack Loading
+
+```{r 01-load-covariates, message=FALSE, warning=FALSE}
+# ==============================================================================
+# CHUNK 1: ENVIRONMENT SETUP & RASTER COVARIATE IMPORT
+# ==============================================================================
+
+library(terra)
+library(sf)
+library(dplyr)
+
+# Set base path for covariates
+cov_dir <- "C:/Users/eldayit/OneDrive - University of Maryland/Desktop/All files/Ventures/Pangolins_Gabon/Input/Objective_2"
+
+# Explicit covariate filenames
+cov_files <- c(
+  "B_distance_to_Forest_Concessions.tif",
+  "B_distance_to_InternationalGabonBorders.tif",
+  "B_distance_to_MajorGabonCities.tif",
+  "B_distance_to_majorRoads.tif",
+  "B_distance_to_ProtectedAreas.tif",
+  "B_distance_to_waterways.tif",
+  "B_LAI_2024.tif",
+  "B_Population_2020.tif",
+  "B_SRTM_2000.tif"
+)
+
+# Construct full paths and verify file existence
+cov_paths <- file.path(cov_dir, cov_files)
+missing_files <- cov_paths[!file.exists(cov_paths)]
+
+if (length(missing_files) > 0) {
+  stop("The following raster files were not found:\n", paste(missing_files, collapse = "\n"))
+}
+
+# Load rasters into SpatRaster stack and clean layer names
+covariates_raw <- rast(cov_paths)
+names(covariates_raw) <- gsub("\\.tif$", "", cov_files)
+
+cat("Chunk 1 Complete: All 9 raw raster covariates successfully imported.\n")
+
+```
+
+2. Spatial Coherence Check, Resampling Alignment, & Composite Index
+
+```{r 02-align-and-composite, message=FALSE, warning=FALSE}
+# ==============================================================================
+# CHUNK 2: SPATIAL ALIGNMENT & COMPOSITE COVARIATE CALCULATIONS
+# ==============================================================================
+
+library(ggplot2)
+library(tidyterra)
+
+# 1. Align all rasters to the template (first layer) geometry
+template_raster <- covariates_raw[[1]]
+aligned_list    <- list()
+
+for (i in 1:nlyr(covariates_raw)) {
+  lyr <- covariates_raw[[i]]
+  if (!compareGeom(template_raster, lyr, stopOnError = FALSE)) {
+    lyr <- resample(lyr, template_raster, method = "bilinear")
+  }
+  aligned_list[[i]] <- lyr
+}
+
+covariates <- rast(aligned_list)
+
+# 2. Compute anthropogenic composite accessibility index
+covariates$B_city_road_composite <- covariates[["B_distance_to_MajorGabonCities"]] + 
+                                    covariates[["B_distance_to_majorRoads"]]
+
+# 3. Visualize component vs. composite accessibility covariates
+accessibility_stack <- subset(
+  covariates, 
+  c("B_distance_to_MajorGabonCities", 
+    "B_distance_to_majorRoads", 
+    "B_city_road_composite")
+)
+
+ggplot() +
+  geom_spatraster(data = accessibility_stack) +
+  facet_wrap(~lyr, ncol = 3) +
+  scale_fill_viridis_c(
+    option   = "magma", 
+    name     = "Distance (m)", 
+    na.value = "transparent"
+  ) +
+  labs(
+    title    = "Anthropogenic Accessibility Covariates (Gabon)",
+    subtitle = "Individual Components vs. Composite Accessibility Index"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text   = element_blank(),
+    axis.ticks  = element_blank(),
+    panel.grid  = element_blank(),
+    strip.text  = element_text(face = "bold", size = 10),
+    plot.title  = element_text(face = "bold")
+  )
+
+```
+
+3. Complete Random Forest Modeling & Spatial Prediction Pipeline Function
+
+```{r 03-rf-pipeline-function, message=FALSE, warning=FALSE}
+# ==============================================================================
+# CHUNK 3: RANDOM FOREST MODEL EVALUATION & FEATURE IMPORTANCE FUNCTION
+# ==============================================================================
+
+library(ranger)
+library(pROC)
+library(spdep)
+library(cowplot)
+library(scales)
+
+# Clean, publication-ready variable lookup labels
+variable_labels <- c(
+  "B_distance_to_MajorGabonCities"          = "Dist. major cities",
+  "B_city_road_composite"                 = "Composite dist. major cities & roads",
+  "B_distance_to_InternationalGabonBorders" = "Dist. international borders",
+  "B_distance_to_majorRoads"              = "Dist. major roads",
+  "B_distance_to_Forest_Concessions"      = "Dist. forest concessions",
+  "B_LAI_2024"                            = "Leaf area index",
+  "B_Population_2020"                     = "Population density",
+  "B_SRTM_2000"                           = "Elevation",
+  "B_distance_to_ProtectedAreas"          = "Dist. protected areas",
+  "B_distance_to_waterways"               = "Dist. waterways"
+)
+
+# Define output directory for saving plots
+output_dir <- "C:/Users/eldayit/OneDrive - University of Maryland/Desktop/All files/Ventures/Pangolins_Gabon/Output/Objective_2"
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+
+#' Run Random Forest Evaluation & Feature Importance for a Given Crime Stage
+run_crime_stage_rf <- function(stage_path, stage_name, covariates_stack) {
+  
+  # ----------------------------------------------------------------------------
+  # 1. Load Presences & Extract Environmental Values
+  # ----------------------------------------------------------------------------
+  pts <- st_read(stage_path, quiet = TRUE) %>% 
+    st_transform(crs(covariates_stack))
+  
+  pres_env   <- terra::extract(covariates_stack, pts, ID = FALSE)
+  valid_pres <- complete.cases(pres_env)
+  
+  pres_df   <- data.frame(presence = 1, pres_env[valid_pres, ])
+  pts_valid <- pts[valid_pres, ]
+  n_pres    <- nrow(pres_df)
+  
+  # ----------------------------------------------------------------------------
+  # 2. Sample Sampling-Bias Weighted Background Points (2:1 Ratio)
+  # ----------------------------------------------------------------------------
+  road_dist    <- covariates_stack[["B_distance_to_majorRoads"]]
+  bias_surface <- exp(-0.0001 * road_dist)
+  
+  set.seed(42)
+  bg_coords <- terra::spatSample(
+    bias_surface, 
+    size   = n_pres * 2, 
+    method = "weights", 
+    xy     = TRUE, 
+    na.rm  = TRUE
+  )
+  
+  bg_pts   <- st_as_sf(as.data.frame(bg_coords), coords = c("x", "y"), crs = crs(covariates_stack))
+  bg_env   <- terra::extract(covariates_stack, bg_pts, ID = FALSE)
+  valid_bg <- complete.cases(bg_env)
+  
+  bg_df        <- data.frame(presence = 0, bg_env[valid_bg, ])
+  bg_pts_valid <- bg_pts[valid_bg, ]
+  
+  # Combine presence and background datasets
+  df          <- rbind(pres_df, bg_df)
+  df$presence <- as.factor(df$presence)
+  
+  # ----------------------------------------------------------------------------
+  # 3. Train/Test Split (70/30) & Random Forest Fitting
+  # ----------------------------------------------------------------------------
+  set.seed(123)
+  train_idx  <- sample(seq_len(nrow(df)), size = 0.70 * nrow(df))
+  train_data <- df[train_idx, ]
+  test_data  <- df[-train_idx, ]
+  
+  rf_model <- ranger(
+    formula     = presence ~ .,
+    data        = train_data,
+    probability = TRUE,
+    num.trees   = 700,
+    importance  = "permutation"
+  )
+  
+  # Evaluate Test AUC
+  test_preds <- predict(rf_model, data = test_data)$predictions[, "1"]
+  roc_obj    <- roc(test_data$presence, test_preds, quiet = TRUE)
+  
+  # ----------------------------------------------------------------------------
+  # 4. Residual Spatial Autocorrelation (Moran's I)
+  # ----------------------------------------------------------------------------
+  full_preds    <- predict(rf_model, data = df)$predictions[, "1"]
+  obs_numeric   <- as.numeric(as.character(df$presence))
+  residuals_vec <- obs_numeric - full_preds
+  
+  all_geom   <- c(st_geometry(pts_valid), st_geometry(bg_pts_valid))
+  coords_mat <- st_coordinates(all_geom)
+  
+  nb <- knn2nb(knearneigh(coords_mat, k = 8))
+  lw <- nb2listw(nb, style = "W")
+  
+  moran_res <- moran.test(residuals_vec, lw)
+  
+  # ----------------------------------------------------------------------------
+  # 5. Print Goodness of Fit & Performance Summary
+  # ----------------------------------------------------------------------------
+  cat("\n============================================================\n")
+  cat("MODEL EVALUATION SUMMARY:", stage_name, "\n")
+  cat("============================================================\n")
+  cat(sprintf("Sample Sizes   : %d Presences | %d Background Points\n", n_pres, nrow(bg_df)))
+  cat(sprintf("Test AUC Score : %.4f\n", auc(roc_obj)))
+  cat(sprintf("OOB Error Rate : %.4f\n", rf_model$prediction.error))
+  cat(sprintf("Moran's I (Res): %.4f (p-value: %.4f)\n", 
+              moran_res$estimate[["Moran I statistic"]], moran_res$p.value))
+  cat("============================================================\n\n")
+
+  # ----------------------------------------------------------------------------
+  # 6. Publication-Ready Feature Importance Plot
+  # ----------------------------------------------------------------------------
+  imp_scores <- importance(rf_model)
+  imp_df <- data.frame(
+    Variable   = names(imp_scores),
+    Importance = as.numeric(imp_scores)
+  ) %>% arrange(desc(Importance))
+  
+  p_imp <- ggplot(imp_df, aes(x = reorder(Variable, Importance), y = Importance)) +
+    geom_col(fill = "#2b5c8f", width = 0.7) +
+    geom_text(
+      aes(label = sprintf("%.2f%%", Importance * 100)),
+      hjust = -0.15, size = 3.5, fontface = "bold", color = "black"
+    ) +
+    scale_x_discrete(labels = variable_labels) +
+    scale_y_continuous(
+      limits = c(0, max(imp_df$Importance) * 1.25),
+      labels = percent_format(accuracy = 1),
+      expand = c(0, 0)
+    ) +
+    coord_flip() +
+    labs(
+      title = paste0("Feature Importance - ", stage_name),
+      x     = "Predictor Variables",
+      y     = "Mean Decrease in Accuracy (%)"
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      panel.grid.minor = element_blank(),
+      plot.title       = element_text(face = "bold", size = 13),
+      axis.title.x     = element_text(face = "bold", size = 11, margin = margin(t = 10)),
+      axis.title.y     = element_text(face = "bold", size = 11, margin = margin(r = 10)),
+      axis.text        = element_text(face = "bold", color = "black")
+    )
+  
+  # Display plot in R Markdown output
+  print(p_imp)
+  
+  # Save Importance Plot PNG
+  clean_stage_id <- gsub("[^A-Za-z0-9]", "_", stage_name)
+  ggsave(
+    filename = file.path(output_dir, paste0("Feature_Importance_", clean_stage_id, ".png")),
+    plot     = p_imp,
+    width    = 9, height = 5.5, dpi = 300, bg = "white"
+  )
+  
+  return(list(
+    model      = rf_model, 
+    roc        = roc_obj, 
+    moran      = moran_res, 
+    importance = imp_df
+  ))
+}
+```
+
+4. EXECUTE MODELING PIPELINE FOR ALL CRIME STAGES
+
+```{r 04-run-all-stages, message=FALSE, warning=FALSE}
+# ==============================================================================
+# CHUNK 4: EXECUTE MODELING EVALUATION & IMPORTANCE FOR ALL STAGES
+# ==============================================================================
+
+input_dir_obj3 <- "C:/Users/eldayit/OneDrive - University of Maryland/Desktop/All files/Ventures/Pangolins_Gabon/Input/Objective_3"
+
+# Stage I (Pre-Activity)
+stage1_results <- run_crime_stage_rf(
+  stage_path       = file.path(input_dir_obj3, "Crime_stage_I.gpkg"),
+  stage_name       = "Stage I (Pre-Activity)",
+  covariates_stack = covariates
+)
+
+# Stage II (Activity)
+stage2_results <- run_crime_stage_rf(
+  stage_path       = file.path(input_dir_obj3, "Crime_stage_II.gpkg"),
+  stage_name       = "Stage II (Activity)",
+  covariates_stack = covariates
+)
+
+# Stage III (Post-Activity)
+stage3_results <- run_crime_stage_rf(
+  stage_path       = file.path(input_dir_obj3, "Crime_stage_III.gpkg"),
+  stage_name       = "Stage III (Post-Activity)",
+  covariates_stack = covariates
+)
+
+```
+
+
