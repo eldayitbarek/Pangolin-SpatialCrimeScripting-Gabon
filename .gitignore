@@ -47,3 +47,54 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+# ==========================================
+# Python Rules
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# ==========================================
+# Sensitive Data, Spreadsheets & Survey Files
+# ==========================================
+*.csv
+*.xlsx
+*.xls
+*.dta
+*.sav
+*.rds
+*.RData
+*.parquet
+
+# ==========================================
+# Secret Keys & Environment Variables
+# ==========================================
+.env
+*.pem
+*.key
+credentials.json
+*_secrets.*
+
+# ==========================================
+# Large Geospatial & Spatial Vector Formats
+# ==========================================
+*.tif
+*.tiff
+*.nc
+*.geojson
+*.shp
+*.dbf
+*.prj
+*.shx
+*.cpg
+*.qpj
+*.gpkg
+*.kml
+*.kmz
+*.gdb/
