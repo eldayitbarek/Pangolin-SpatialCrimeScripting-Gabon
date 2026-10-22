@@ -1,325 +1,858 @@
 ---
-title: "Pangolin Wildlife Trade Spatial Modeling - Gabon"
-subtitle: "Objective 3: Random Forest Model Evaluation and Feature Importance Analysis"
-author: "Elda Yitbarek Bezuayene"
-date: "`r Sys.Date()`"
-output: github_document
+title: "Objective 3"
+author: "Elda"
+date: "2026-10-20"
+output:
+  pdf_document: default
+  html_document: default
 ---
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-1. Setup, File Existence Check, and Raster Stack Loading
+Loading packages 
 
-```{r 01-load-covariates, message=FALSE, warning=FALSE}
-# ==============================================================================
-# CHUNK 1: ENVIRONMENT SETUP & RASTER COVARIATE IMPORT
-# ==============================================================================
-
+```{r}
 library(terra)
 library(sf)
 library(dplyr)
+library(mgcv)
+library(spdep)
+library(PRROC)
 
-# Set base path for covariates
-cov_dir <- "C:/Users/eldayit/OneDrive - University of Maryland/Desktop/All files/Ventures/Pangolins_Gabon/Input/Objective_2"
+# Folder containing the three crime-stage GeoPackages
+OBJECTIVE3_DIR <- "C:/Users/eldayit/OneDrive - University of Maryland/Desktop/All files/Ventures/Pangolins_Gabon/Input/Objective_3"
 
-# Explicit covariate filenames
-cov_files <- c(
-  "B_distance_to_Forest_Concessions.tif",
-  "B_distance_to_InternationalGabonBorders.tif",
-  "B_distance_to_MajorGabonCities.tif",
-  "B_distance_to_majorRoads.tif",
-  "B_distance_to_ProtectedAreas.tif",
-  "B_distance_to_waterways.tif",
-  "B_LAI_2024.tif",
-  "B_Population_2020.tif",
-  "B_SRTM_2000.tif"
+INPUT_DIR <- dirname(OBJECTIVE3_DIR)
+
+# Crime-stage files
+stage_files <- c(
+  Stage_I   = file.path(OBJECTIVE3_DIR, "Crime_stage_I.gpkg"),
+  Stage_II  = file.path(OBJECTIVE3_DIR, "Crime_stage_II.gpkg"),
+  Stage_III = file.path(OBJECTIVE3_DIR, "Crime_stage_III.gpkg")
 )
 
-# Construct full paths and verify file existence
-cov_paths <- file.path(cov_dir, cov_files)
-missing_files <- cov_paths[!file.exists(cov_paths)]
+# The exact nine covariates used in the previous analysis
+covariate_names <- c(
+  "B_distance_to_Forest_Concessions",
+  "B_distance_to_InternationalGabonBorders",
+  "B_distance_to_MajorGabonCities",
+  "B_distance_to_majorRoads",
+  "B_distance_to_ProtectedAreas",
+  "B_distance_to_waterways",
+  "B_LAI_2024",
+  "B_Population_2020",
+  "B_SRTM_2000"
+)
 
-if (length(missing_files) > 0) {
-  stop("The following raster files were not found:\n", paste(missing_files, collapse = "\n"))
+# Spatial cross-validation settings
+N_FOLDS <- 5
+BLOCK_SIZE_M <- 80000 #[m]
+SPATIAL_K <- 20 # Maximum allowed complexity (basis dimension) of the 2-D spatial smooth s(x, y)
+
+stopifnot(all(file.exists(stage_files)))
+
+# Knitting runs in a fresh R session, so load the stage data here.
+crime_points <- lapply(stage_files, function(f) st_read(f, quiet = TRUE))
+
+# Use the first stage's CRS consistently for the initial vector maps.
+if (is.na(st_crs(crime_points[[1]]))) {
+  stop("The Stage I point data have no CRS. Define their CRS before proceeding.")
+}
+crime_points <- lapply(crime_points, function(x) {
+  if (is.na(st_crs(x))) stop("A crime-stage dataset has no CRS.")
+  st_transform(x, st_crs(crime_points[[1]]))
+})
+```
+
+1. Loading and visualizing the 3 crime stages and the 9 covariates
+
+```{r}
+# Gabon national boundary
+gabon_boundary_file <- "C:/Users/eldayit/OneDrive - University of Maryland/Desktop/All files/Ventures/Pangolins_Gabon/AuxiliaryDatasets/Gabon_country_boundary_UNOCHA_EPSG5223.gpkg"
+
+# Major roads
+roads_file <- "C:/Users/eldayit/OneDrive - University of Maryland/Desktop/All files/Ventures/Pangolins_Gabon/Input/Objective_2/Vector_Roads_Primary_Secondary_Trunk_link_UNOCHA_EPSG5223.gpkg"
+
+# National parks / protected areas
+parks_file <- "C:/Users/eldayit/OneDrive - University of Maryland/Desktop/All files/Ventures/Pangolins_Gabon/AuxiliaryDatasets/NationalPark_WDPA_EPSG5223.gpkg"
+
+gabon_boundary <- st_read(gabon_boundary_file, quiet = TRUE)
+major_roads <- st_read(roads_file, quiet = TRUE)
+national_parks <- st_read(parks_file, quiet = TRUE)
+
+# Ensure all layers use the point-data CRS
+target_crs <- st_crs(crime_points[[1]])
+
+gabon_boundary <- st_transform(gabon_boundary, target_crs)
+major_roads <- st_transform(major_roads, target_crs)
+national_parks <- st_transform(national_parks, target_crs)
+
+# Print point counts
+sapply(crime_points, nrow)
+
+# Map the three crime stages over the Gabon boundary, national parks, and roads
+par(mfrow = c(1, 3), mar = c(2, 2, 3, 1))
+
+stage_cols <- c(
+  Stage_I = "#1b9e77",
+  Stage_II = "#d95f02",
+  Stage_III = "#7570b3"
+)
+
+for (stage_name in names(crime_points)) {
+
+  # Gabon outline
+  plot(
+    st_geometry(gabon_boundary),
+    col = "grey95",
+    border = "grey35",
+    main = paste("Crime", gsub("_", " ", stage_name)),
+    axes = TRUE
+  )
+
+  # National parks / protected areas
+  plot(
+    st_geometry(national_parks),
+    col = adjustcolor("#74a96f", alpha.f = 0.35),
+    border = "#3e7d3a",
+    lwd = 0.5,
+    add = TRUE
+  )
+
+  # Major roads
+  plot(
+    st_geometry(major_roads),
+    col = "grey45",
+    lwd = 0.35,
+    add = TRUE
+  )
+
+  # Participatory-mapped points
+  plot(
+    st_geometry(crime_points[[stage_name]]),
+    col = stage_cols[stage_name],
+    pch = 16,
+    cex = 0.45,
+    add = TRUE
+  )
 }
 
-# Load rasters into SpatRaster stack and clean layer names
-covariates_raw <- rast(cov_paths)
-names(covariates_raw) <- gsub("\\.tif$", "", cov_files)
+par(mfrow = c(1, 1))
+```
 
-cat("Chunk 1 Complete: All 9 raw raster covariates successfully imported.\n")
+2. Loading and visualizing the 9 covariates
+
+```{r}
+# Search both Input and Objective_3 recursively for GeoTIFF files.
+search_folders <- unique(c(INPUT_DIR, OBJECTIVE3_DIR))
+
+all_raster_files <- unlist(
+  lapply(search_folders, function(folder) {
+    list.files(
+      folder,
+      pattern = "\\.(tif|tiff)$",
+      full.names = TRUE,
+      recursive = TRUE,
+      ignore.case = TRUE
+    )
+  })
+)
+
+all_raster_files <- unique(all_raster_files)
+
+if (length(all_raster_files) == 0) {
+  stop(
+    "No .tif or .tiff files were found under:\n",
+    paste(search_folders, collapse = "\n")
+  )
+}
+
+# Remove file extension and match each expected covariate name.
+raster_base_names <- tools::file_path_sans_ext(basename(all_raster_files))
+
+cov_files <- sapply(covariate_names, function(covariate) {
+
+  matching_file <- all_raster_files[
+    tolower(raster_base_names) == tolower(covariate)
+  ]
+
+  if (length(matching_file) == 0) {
+    return(NA_character_)
+  }
+
+  matching_file[1]
+})
+
+names(cov_files) <- covariate_names
+
+# Stop and tell you exactly which covariate file was not located.
+if (any(is.na(cov_files))) {
+  missing_covariates <- names(cov_files)[is.na(cov_files)]
+
+  cat("These raster files were found:\n")
+  print(all_raster_files)
+
+  stop(
+    "\nCould not find these expected covariate rasters:\n",
+    paste(missing_covariates, collapse = "\n"),
+    "\n\nCheck whether their filenames differ from the names in covariate_names."
+  )
+}
+
+# Print the exact files used.
+cat("The following nine covariate rasters will be used:\n")
+print(cov_files)
+
+# Verify each input grid before stacking.
+cov_layers <- lapply(unname(cov_files), terra::rast)
+alignment_ok <- vapply(cov_layers, function(layer) {
+  terra::compareGeom(cov_layers[[1]], layer, stopOnError = FALSE)
+}, logical(1))
+if (!all(alignment_ok)) {
+  stop("Covariate grids are not aligned: ",
+       paste(covariate_names[!alignment_ok], collapse = ", "))
+}
+cat("All nine covariate grids are aligned.\n")
+
+# Load rasters in the intended covariate order.
+covs <- rast(cov_layers)
+names(covs) <- covariate_names
+
+# Reproject points to the covariate grid before rasterization.
+crime_points <- lapply(crime_points, function(x) st_transform(x, crs(covs)))
+
+print(covs)
+
+# Map all nine covariates.
+par(mfrow = c(3, 3), mar = c(2, 2, 3, 4))
+
+for (j in seq_len(nlyr(covs))) {
+  plot(covs[[j]], main = names(covs)[j])
+}
+
+par(mfrow = c(1, 1))
+```
+
+3. Check CRS, grid alignment, extent, resolution, and covariate correlation
+
+```{r}
+# 2. Spearman correlation: calculate without printing the full matrix
+cov_values <- as.data.frame(covs, na.rm = TRUE)
+
+cor_matrix <- cor(
+  cov_values,
+  method = "spearman",
+  use = "complete.obs"
+)
+
+# 3. Keep each covariate pair once; remove diagonal self-correlations
+cor_pairs <- as.data.frame(as.table(cor_matrix), stringsAsFactors = FALSE) |>
+  dplyr::rename(
+    variable_1 = Var1,
+    variable_2 = Var2,
+    spearman_rho = Freq
+  ) |>
+  dplyr::mutate(
+    abs_rho = abs(spearman_rho),
+    keep_pair = match(variable_1, colnames(cor_matrix)) <
+      match(variable_2, colnames(cor_matrix))
+  ) |>
+  dplyr::filter(keep_pair) |>
+  dplyr::select(-keep_pair)
+
+# Most negative, most positive, and strongest absolute correlation
+min_pair <- cor_pairs |>
+  dplyr::slice_min(spearman_rho, n = 1, with_ties = FALSE)
+
+max_pair <- cor_pairs |>
+  dplyr::slice_max(spearman_rho, n = 1, with_ties = FALSE)
+
+strongest_pair <- cor_pairs |>
+  dplyr::slice_max(abs_rho, n = 1, with_ties = FALSE)
+
+cat("\n================ SPEARMAN CORRELATION SUMMARY ================\n")
+
+cat(
+  "\nMinimum correlation:\n  rho = ", round(min_pair$spearman_rho, 3),
+  "\n  Variables: ", min_pair$variable_1,
+  " and ", min_pair$variable_2, "\n",
+  sep = ""
+)
+
+cat(
+  "\nMaximum correlation:\n  rho = ", round(max_pair$spearman_rho, 3),
+  "\n  Variables: ", max_pair$variable_1,
+  " and ", max_pair$variable_2, "\n",
+  sep = ""
+)
+
+cat(
+  "\nLargest absolute correlation used for collinearity screening:\n  |rho| = ",
+  round(strongest_pair$abs_rho, 3),
+  "\n  Variables: ", strongest_pair$variable_1,
+  " and ", strongest_pair$variable_2, "\n",
+  sep = ""
+)
+
+if (strongest_pair$abs_rho < 0.70) {
+  cat("\nNo pair exceeded |rho| = 0.70; all covariates are retained.\n")
+} else {
+  cat("\nAt least one pair reached |rho| = 0.70; review correlated covariates.\n")
+}
+```
+
+4. Convert points to binary occurrence maps on the covariate grid
+
+```{r}
+template_raster <- covs[[1]]
+
+# Keep only cells where every covariate has a non-missing value.
+valid_mask <- app(covs, fun = function(x) as.integer(all(!is.na(x))))
+
+stage_counts <- list()
+stage_occurrence <- list()
+
+for (stage_name in names(crime_points)) {
+
+  pts <- crime_points[[stage_name]]
+  pts$one_point <- 1
+
+  # Count points in each covariate-grid cell.
+  count_raster <- rasterize(
+    vect(pts),
+    template_raster,
+    field = "one_point",
+    fun = "sum",
+    background = 0
+  )
+
+  # Convert counts to binary occurrence: 0 = no point, 1 = >= 1 point.
+  occurrence_raster <- ifel(count_raster > 0, 1, 0)
+
+  # Remove cells lacking any covariate value.
+  count_raster <- mask(count_raster, valid_mask, maskvalues = 0)
+  occurrence_raster <- mask(occurrence_raster, valid_mask, maskvalues = 0)
+
+  names(count_raster) <- paste0(stage_name, "_count")
+  names(occurrence_raster) <- paste0(stage_name, "_occurrence")
+
+  stage_counts[[stage_name]] <- count_raster
+  stage_occurrence[[stage_name]] <- occurrence_raster
+
+  # Console summary
+  n_valid_cells <- global(!is.na(occurrence_raster), "sum", na.rm = TRUE)[1, 1]
+  n_positive_cells <- global(occurrence_raster, "sum", na.rm = TRUE)[1, 1]
+
+  cat("\n", stage_name, "\n", sep = "")
+  cat("Total participatory-mapped points:", nrow(pts), "\n")
+  cat("Positive covariate-grid cells:", n_positive_cells, "\n")
+  cat("Valid covariate-grid cells:", n_valid_cells, "\n")
+  cat("Percentage of cells containing >=1 mapped point:",
+      round(100 * n_positive_cells / n_valid_cells, 3), "%\n")
+}
+
+# Map the binary occurrence rasters
+par(mfrow = c(1, 3), mar = c(2, 2, 3, 2))
+
+for (stage_name in names(stage_occurrence)) {
+  plot(
+    stage_occurrence[[stage_name]],
+    col = c("grey95", "#d73027"),
+    breaks = c(-0.5, 0.5, 1.5),
+    legend = FALSE,
+    main = paste(gsub("_", " ", stage_name), "occurrence")
+  )
+  legend(
+    "bottomleft",
+    legend = c("No mapped point", ">=1 mapped point"),
+    fill = c("grey95", "#d73027"),
+    bty = "n"
+  )
+}
+
+par(mfrow = c(1, 1))
+
+# Folder for exported maps
+OUTPUT_DIR <- "C:/Users/eldayit/OneDrive - University of Maryland/Desktop/All files/Ventures/Pangolins_Gabon/Output/Maps"
+
+# Create the folder if it does not already exist
+if (!dir.exists(OUTPUT_DIR)) {
+  dir.create(OUTPUT_DIR, recursive = TRUE)
+}
 
 ```
 
-2. Spatial Coherence Check, Resampling Alignment, & Composite Index
+5. Standardize covariates, create spatial folds, and perform spatial cross-validation
 
-```{r 02-align-and-composite, message=FALSE, warning=FALSE}
-# ==============================================================================
-# CHUNK 2: SPATIAL ALIGNMENT & COMPOSITE COVARIATE CALCULATIONS
-# ==============================================================================
+```{r}
+# Standardize covariates using all valid Gabon grid cells.
+cov_means <- sapply(cov_values, mean, na.rm = TRUE)
+cov_sds <- sapply(cov_values, sd, na.rm = TRUE)
 
-library(ggplot2)
-library(tidyterra)
+covs_z <- covs
 
-# 1. Align all rasters to the template (first layer) geometry
-template_raster <- covariates_raw[[1]]
-aligned_list    <- list()
-
-for (i in 1:nlyr(covariates_raw)) {
-  lyr <- covariates_raw[[i]]
-  if (!compareGeom(template_raster, lyr, stopOnError = FALSE)) {
-    lyr <- resample(lyr, template_raster, method = "bilinear")
-  }
-  aligned_list[[i]] <- lyr
+for (j in seq_len(nlyr(covs))) {
+  covs_z[[j]] <- (covs[[j]] - cov_means[j]) / cov_sds[j]
 }
 
-covariates <- rast(aligned_list)
+names(covs_z) <- paste0("z_", names(covs))
 
-# 2. Compute anthropogenic composite accessibility index
-covariates$B_city_road_composite <- covariates[["B_distance_to_MajorGabonCities"]] + 
-                                    covariates[["B_distance_to_majorRoads"]]
+# Create one modelling table containing coordinates, standardized covariates,
+# and the three binary occurrence outcomes.
+model_rasters <- c(covs_z, rast(stage_occurrence))
 
-# 3. Visualize component vs. composite accessibility covariates
-accessibility_stack <- subset(
-  covariates, 
-  c("B_distance_to_MajorGabonCities", 
-    "B_distance_to_majorRoads", 
-    "B_city_road_composite")
+model_df <- as.data.frame(
+  model_rasters,
+  xy = TRUE,
+  na.rm = TRUE
 )
 
-ggplot() +
-  geom_spatraster(data = accessibility_stack) +
-  facet_wrap(~lyr, ncol = 3) +
-  scale_fill_viridis_c(
-    option   = "magma", 
-    name     = "Distance (m)", 
-    na.value = "transparent"
+# Make regular preliminary spatial blocks, then group them into five
+# broad, geographically compact cross-validation folds.
+model_df$block_x <- floor((model_df$x - min(model_df$x)) / BLOCK_SIZE_M)
+model_df$block_y <- floor((model_df$y - min(model_df$y)) / BLOCK_SIZE_M)
+model_df$small_block <- interaction(model_df$block_x, model_df$block_y, drop = TRUE)
+
+outcome_names <- names(stage_occurrence)
+z_covariate_names <- names(covs_z)
+
+block_summary <- model_df |>
+  dplyr::group_by(small_block) |>
+  dplyr::summarise(
+    x = mean(x),
+    y = mean(y),
+    dplyr::across(dplyr::all_of(outcome_names), sum),
+    .groups = "drop"
+  )
+
+# Try several seeds and retain the geographically compact fold arrangement
+# with the best distribution of positive cells across folds.
+best_solution <- NULL
+best_minimum <- -Inf
+
+for (seed in 1:100) {
+  set.seed(seed)
+
+  km <- kmeans(
+    scale(block_summary[, c("x", "y")]),
+    centers = N_FOLDS,
+    nstart = 20
+  )
+
+  candidate <- block_summary
+  candidate$fold <- km$cluster
+
+  positive_by_fold <- candidate |>
+    dplyr::group_by(fold) |>
+    dplyr::summarise(
+      dplyr::across(dplyr::all_of(outcome_names), sum),
+      .groups = "drop"
+    )
+
+  smallest_positive_count <- min(as.matrix(positive_by_fold[, outcome_names]))
+
+  if (smallest_positive_count > best_minimum) {
+    best_minimum <- smallest_positive_count
+    best_solution <- candidate
+  }
+}
+
+model_df <- model_df |>
+  dplyr::left_join(
+    best_solution[, c("small_block", "fold")],
+    by = "small_block"
+  )
+
+cat("Number of preliminary", BLOCK_SIZE_M / 1000, "km spatial blocks:",
+    nrow(block_summary), "\n")
+cat("Number of broad spatial cross-validation folds:", N_FOLDS, "\n\n")
+
+fold_prevalence <- model_df |>
+  dplyr::group_by(fold) |>
+  dplyr::summarise(
+    n_cells = dplyr::n(),
+    dplyr::across(
+      dplyr::all_of(outcome_names),
+      list(n_positive = ~ sum(.x), prevalence = ~ mean(.x))
+    ),
+    .groups = "drop"
+  )
+
+print(fold_prevalence, n = Inf)
+
+# Formula: occurrence ~ nine standardized covariates + broad 2-D spatial surface
+gam_formula <- as.formula(
+  paste(
+    "OUTCOME ~",
+    paste(z_covariate_names, collapse = " + "),
+    "+ s(x, y, k =", SPATIAL_K, ", bs = 'tp')"
+  )
+)
+
+# Function for PR-AUC
+calculate_pr_auc <- function(observed, predicted) {
+  PRROC::pr.curve(
+    scores.class0 = predicted[observed == 1],
+    scores.class1 = predicted[observed == 0],
+    curve = FALSE
+  )$auc.integral
+}
+
+# Fit spatial binomial GAMs using held-out spatial folds.
+oof_predictions <- list()
+fold_metrics <- list()
+
+for (outcome_name in outcome_names) {
+
+  cat("\nRunning spatial cross-validation for", outcome_name, "\n")
+
+  stage_oof <- list()
+  stage_metrics <- list()
+
+  for (held_out_fold in sort(unique(model_df$fold))) {
+
+    cat("  Held-out fold", held_out_fold, "of", N_FOLDS, "\n")
+
+    train_df <- model_df |>
+      dplyr::filter(fold != held_out_fold)
+
+    test_df <- model_df |>
+      dplyr::filter(fold == held_out_fold)
+
+    fold_formula <- update(
+      gam_formula,
+      paste(outcome_name, "~ .")
+    )
+
+    fold_model <- bam(
+      formula = fold_formula,
+      family = binomial(link = "logit"),
+      data = train_df,
+      method = "fREML",
+      discrete = TRUE
+    )
+
+    test_df$predicted_probability <- as.numeric(
+      predict(fold_model, newdata = test_df, type = "response")
+    )
+
+    observed <- test_df[[outcome_name]]
+    predicted <- test_df$predicted_probability
+    prevalence <- mean(observed)
+
+    stage_metrics[[as.character(held_out_fold)]] <- data.frame(
+      stage = outcome_name,
+      fold = held_out_fold,
+      n_cells = nrow(test_df),
+      n_positive = sum(observed),
+      prevalence = prevalence,
+      PR_AUC = calculate_pr_auc(observed, predicted),
+      Brier_score = mean((observed - predicted)^2),
+      Brier_prevalence_baseline = mean((observed - prevalence)^2)
+    )
+
+    stage_oof[[as.character(held_out_fold)]] <- test_df |>
+      dplyr::select(
+        x, y, fold,
+        observed = dplyr::all_of(outcome_name),
+        predicted_probability
+      )
+  }
+
+  stage_oof <- dplyr::bind_rows(stage_oof)
+  stage_oof$stage <- outcome_name
+
+  oof_predictions[[outcome_name]] <- stage_oof
+  fold_metrics[[outcome_name]] <- dplyr::bind_rows(stage_metrics)
+}
+
+oof_predictions <- dplyr::bind_rows(oof_predictions)
+fold_metrics <- dplyr::bind_rows(fold_metrics)
+
+cat("\nFold-specific spatial cross-validation metrics:\n")
+print(fold_metrics, row.names = FALSE)
+
+# Overall OOF metrics: all held-out predictions combined across folds.
+overall_metrics <- oof_predictions |>
+  dplyr::group_by(stage) |>
+  dplyr::summarise(
+    n_cells = dplyr::n(),
+    positive_cell_prevalence = mean(observed),
+    PR_AUC = calculate_pr_auc(observed, predicted_probability),
+    Brier_score = mean((observed - predicted_probability)^2),
+    Brier_prevalence_baseline = mean((observed - mean(observed))^2),
+    Brier_skill_vs_prevalence =
+      1 - Brier_score / Brier_prevalence_baseline,
+    .groups = "drop"
+  )
+
+cat("\nOverall spatial out-of-fold metrics:\n")
+print(overall_metrics, n = Inf)
+
+# Moran's I of out-of-fold residuals.
+# Eight nearest neighbouring cells define spatial neighbours.
+morans_results <- list()
+
+for (stage_name in unique(oof_predictions$stage)) {
+
+  this_stage <- oof_predictions |>
+    dplyr::filter(stage == stage_name)
+
+  residuals_oof <- this_stage$observed - this_stage$predicted_probability
+  coordinates_oof <- as.matrix(this_stage[, c("x", "y")])
+
+  neighbours <- knn2nb(knearneigh(coordinates_oof, k = 8))
+  spatial_weights <- nb2listw(neighbours, style = "W", zero.policy = TRUE)
+
+  morans_results[[stage_name]] <- moran.test(
+    residuals_oof,
+    spatial_weights,
+    zero.policy = TRUE
+  )
+
+  cat("\nOut-of-fold residual Moran's I for", stage_name, ":\n")
+  print(morans_results[[stage_name]])
+}
+```
+
+6. Refit final models using all Gabon cells, map final probabilities, and print coefficients
+
+```{r}
+final_models <- list()
+final_probability_maps <- list()
+coefficient_tables <- list()
+
+for (outcome_name in outcome_names) {
+
+  cat("\nFitting final all-Gabon model for", outcome_name, "\n")
+
+  final_formula <- update(
+    gam_formula,
+    paste(outcome_name, "~ .")
+  )
+
+  final_model <- bam(
+    formula = final_formula,
+    family = binomial(link = "logit"),
+    data = model_df,
+    method = "fREML",
+    discrete = TRUE
+  )
+
+  final_models[[outcome_name]] <- final_model
+
+  # Final predicted probability for every valid covariate-grid cell.
+  model_df$final_probability <- as.numeric(
+    predict(final_model, newdata = model_df, type = "response")
+  )
+
+  probability_raster <- template_raster
+  values(probability_raster) <- NA_real_
+
+  cell_numbers <- cellFromXY(
+    probability_raster,
+    model_df[, c("x", "y")]
+  )
+
+  values(probability_raster)[cell_numbers] <- model_df$final_probability
+  names(probability_raster) <- paste0(outcome_name, "_occurrence_probability")
+
+  final_probability_maps[[outcome_name]] <- probability_raster
+
+  # Parametric covariate coefficients and odds ratios.
+  coefficient_table <- as.data.frame(summary(final_model)$p.table)
+  coefficient_table$term <- rownames(coefficient_table)
+  rownames(coefficient_table) <- NULL
+
+  coefficient_table <- coefficient_table |>
+    dplyr::filter(term != "(Intercept)") |>
+    dplyr::mutate(
+      odds_ratio = exp(Estimate),
+      stage = outcome_name
+    ) |>
+    dplyr::select(stage, term, Estimate, `Std. Error`, `z value`,
+                  `Pr(>|z|)`, odds_ratio)
+
+  coefficient_tables[[outcome_name]] <- coefficient_table
+
+  cat("\nStandardized covariate coefficients for", outcome_name, ":\n")
+  print(coefficient_table, row.names = FALSE)
+
+  cat("\nFull GAM summary, including the spatial smooth:\n")
+  print(summary(final_model))
+}
+
+coefficient_tables <- dplyr::bind_rows(coefficient_tables)
+
+# Map final occurrence probabilities.
+par(mfrow = c(1, 3), mar = c(2, 2, 3, 4))
+
+for (stage_name in names(final_probability_maps)) {
+  plot(
+    final_probability_maps[[stage_name]],
+    main = paste(gsub("_", " ", stage_name), "predicted occurrence probability")
+  )
+}
+
+par(mfrow = c(1, 1))
+# Folder for exported maps
+OUTPUT_DIR <- "C:/Users/eldayit/OneDrive - University of Maryland/Desktop/All files/Ventures/Pangolins_Gabon/Output/Maps"
+
+if (!dir.exists(OUTPUT_DIR)) {
+  dir.create(OUTPUT_DIR, recursive = TRUE)
+}
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+
+# Prepare coefficients and approximate 95% confidence intervals
+plot_data <- coefficient_tables |>
+  mutate(
+    covariate = case_when(
+      term == "z_B_distance_to_Forest_Concessions" ~
+        "Distance to forest concessions",
+      term == "z_B_distance_to_InternationalGabonBorders" ~
+        "Distance to international borders",
+      term == "z_B_distance_to_MajorGabonCities" ~
+        "Distance to major cities",
+      term == "z_B_distance_to_majorRoads" ~
+        "Distance to major roads",
+      term == "z_B_distance_to_ProtectedAreas" ~
+        "Distance to protected areas",
+      term == "z_B_distance_to_waterways" ~
+        "Distance to waterways",
+      term == "z_B_LAI_2024" ~
+        "Leaf area index",
+      term == "z_B_Population_2020" ~
+        "Population density",
+      term == "z_B_SRTM_2000" ~
+        "Elevation",
+      TRUE ~ term
+    ),
+
+    stage = factor(
+      stage,
+      levels = c("Stage_I", "Stage_II", "Stage_III"),
+      labels = c("Stage I", "Stage II", "Stage III")
+    ),
+
+    # Approximate 95% Wald confidence intervals
+    lower_ci = Estimate - 1.96 * `Std. Error`,
+    upper_ci = Estimate + 1.96 * `Std. Error`
+  )
+
+# Order covariates by their largest |coefficient| across the three stages
+covariate_order <- plot_data |>
+  group_by(covariate) |>
+  summarise(
+    max_abs_coefficient = max(abs(Estimate), na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  arrange(max_abs_coefficient) |>
+  pull(covariate)
+
+plot_data <- plot_data |>
+  mutate(
+    covariate = factor(covariate, levels = covariate_order)
+  )
+
+# Colours for the three crime stages
+stage_colours <- c(
+  "Stage I"   = "#1b9e77",
+  "Stage II"  = "#d95f02",
+  "Stage III" = "#7570b3"
+)
+
+# Slightly separate the three estimates within each covariate row
+stage_dodge <- position_dodge(width = 0.6, reverse = TRUE)
+
+coefficient_plot <- ggplot(
+  plot_data,
+  aes(x = Estimate, y = covariate, colour = stage)
+) +
+  geom_vline(
+    xintercept = 0,
+    linetype = "dashed",
+    colour = "grey50"
+  ) +
+  geom_errorbar(
+    aes(xmin = lower_ci, xmax = upper_ci),
+    orientation = "y",
+    position = stage_dodge,
+    width = 0.15,
+    linewidth = 0.5
+  ) +
+  geom_point(
+    position = stage_dodge,
+    size = 2.8
+  ) +
+  scale_colour_manual(
+    values = stage_colours,
+    name = "Crime stage"
   ) +
   labs(
-    title    = "Anthropogenic Accessibility Covariates (Gabon)",
-    subtitle = "Individual Components vs. Composite Accessibility Index"
+    x = expression("Standardized coefficient (" * beta * ")"),
+    y = NULL
   ) +
-  theme_minimal(base_size = 11) +
+  theme_bw(base_size = 11) +
   theme(
-    axis.text   = element_blank(),
-    axis.ticks  = element_blank(),
-    panel.grid  = element_blank(),
-    strip.text  = element_text(face = "bold", size = 10),
-    plot.title  = element_text(face = "bold")
+  axis.text.x = element_text(size = 13, colour = "black"),
+  axis.text.y = element_text(size = 13, face = "bold", colour = "black"),
+  axis.title.x = element_text(size = 13, face = "bold", colour = "black"),
+
+  legend.position = "top",
+  legend.justification = "right",
+  legend.direction = "horizontal",
+  legend.background = element_rect(fill = "white", colour = "grey70"),
+  legend.title = element_text(face = "bold", colour = "black"),
+  legend.text = element_text(face = "bold", colour = "black"),
+
+  panel.grid.minor = element_blank(),
+  panel.grid.major.y = element_blank()
   )
 
-```
+# Display the plot
+print(coefficient_plot)
 
-3. Complete Random Forest Modeling & Spatial Prediction Pipeline Function
+# Folder for the exported figure
+OUTPUT_DIR <- "C:/Users/eldayit/OneDrive - University of Maryland/Desktop/All files/Ventures/Pangolins_Gabon/Output/Maps"
 
-```{r 03-rf-pipeline-function, message=FALSE, warning=FALSE}
-# ==============================================================================
-# CHUNK 3: RANDOM FOREST MODEL EVALUATION & FEATURE IMPORTANCE FUNCTION
-# ==============================================================================
-
-library(ranger)
-library(pROC)
-library(spdep)
-library(cowplot)
-library(scales)
-
-# Clean, publication-ready variable lookup labels
-variable_labels <- c(
-  "B_distance_to_MajorGabonCities"          = "Dist. major cities",
-  "B_city_road_composite"                 = "Composite dist. major cities & roads",
-  "B_distance_to_InternationalGabonBorders" = "Dist. international borders",
-  "B_distance_to_majorRoads"              = "Dist. major roads",
-  "B_distance_to_Forest_Concessions"      = "Dist. forest concessions",
-  "B_LAI_2024"                            = "Leaf area index",
-  "B_Population_2020"                     = "Population density",
-  "B_SRTM_2000"                           = "Elevation",
-  "B_distance_to_ProtectedAreas"          = "Dist. protected areas",
-  "B_distance_to_waterways"               = "Dist. waterways"
-)
-
-# Define output directory for saving plots
-output_dir <- "C:/Users/eldayit/OneDrive - University of Maryland/Desktop/All files/Ventures/Pangolins_Gabon/Output/Objective_2"
-if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
-
-
-#' Run Random Forest Evaluation & Feature Importance for a Given Crime Stage
-run_crime_stage_rf <- function(stage_path, stage_name, covariates_stack) {
-  
-  # ----------------------------------------------------------------------------
-  # 1. Load Presences & Extract Environmental Values
-  # ----------------------------------------------------------------------------
-  pts <- st_read(stage_path, quiet = TRUE) %>% 
-    st_transform(crs(covariates_stack))
-  
-  pres_env   <- terra::extract(covariates_stack, pts, ID = FALSE)
-  valid_pres <- complete.cases(pres_env)
-  
-  pres_df   <- data.frame(presence = 1, pres_env[valid_pres, ])
-  pts_valid <- pts[valid_pres, ]
-  n_pres    <- nrow(pres_df)
-  
-  # ----------------------------------------------------------------------------
-  # 2. Sample Sampling-Bias Weighted Background Points (2:1 Ratio)
-  # ----------------------------------------------------------------------------
-  road_dist    <- covariates_stack[["B_distance_to_majorRoads"]]
-  bias_surface <- exp(-0.0001 * road_dist)
-  
-  set.seed(42)
-  bg_coords <- terra::spatSample(
-    bias_surface, 
-    size   = n_pres * 2, 
-    method = "weights", 
-    xy     = TRUE, 
-    na.rm  = TRUE
-  )
-  
-  bg_pts   <- st_as_sf(as.data.frame(bg_coords), coords = c("x", "y"), crs = crs(covariates_stack))
-  bg_env   <- terra::extract(covariates_stack, bg_pts, ID = FALSE)
-  valid_bg <- complete.cases(bg_env)
-  
-  bg_df        <- data.frame(presence = 0, bg_env[valid_bg, ])
-  bg_pts_valid <- bg_pts[valid_bg, ]
-  
-  # Combine presence and background datasets
-  df          <- rbind(pres_df, bg_df)
-  df$presence <- as.factor(df$presence)
-  
-  # ----------------------------------------------------------------------------
-  # 3. Train/Test Split (70/30) & Random Forest Fitting
-  # ----------------------------------------------------------------------------
-  set.seed(123)
-  train_idx  <- sample(seq_len(nrow(df)), size = 0.70 * nrow(df))
-  train_data <- df[train_idx, ]
-  test_data  <- df[-train_idx, ]
-  
-  rf_model <- ranger(
-    formula     = presence ~ .,
-    data        = train_data,
-    probability = TRUE,
-    num.trees   = 700,
-    importance  = "permutation"
-  )
-  
-  # Evaluate Test AUC
-  test_preds <- predict(rf_model, data = test_data)$predictions[, "1"]
-  roc_obj    <- roc(test_data$presence, test_preds, quiet = TRUE)
-  
-  # ----------------------------------------------------------------------------
-  # 4. Residual Spatial Autocorrelation (Moran's I)
-  # ----------------------------------------------------------------------------
-  full_preds    <- predict(rf_model, data = df)$predictions[, "1"]
-  obs_numeric   <- as.numeric(as.character(df$presence))
-  residuals_vec <- obs_numeric - full_preds
-  
-  all_geom   <- c(st_geometry(pts_valid), st_geometry(bg_pts_valid))
-  coords_mat <- st_coordinates(all_geom)
-  
-  nb <- knn2nb(knearneigh(coords_mat, k = 8))
-  lw <- nb2listw(nb, style = "W")
-  
-  moran_res <- moran.test(residuals_vec, lw)
-  
-  # ----------------------------------------------------------------------------
-  # 5. Print Goodness of Fit & Performance Summary
-  # ----------------------------------------------------------------------------
-  cat("\n============================================================\n")
-  cat("MODEL EVALUATION SUMMARY:", stage_name, "\n")
-  cat("============================================================\n")
-  cat(sprintf("Sample Sizes   : %d Presences | %d Background Points\n", n_pres, nrow(bg_df)))
-  cat(sprintf("Test AUC Score : %.4f\n", auc(roc_obj)))
-  cat(sprintf("OOB Error Rate : %.4f\n", rf_model$prediction.error))
-  cat(sprintf("Moran's I (Res): %.4f (p-value: %.4f)\n", 
-              moran_res$estimate[["Moran I statistic"]], moran_res$p.value))
-  cat("============================================================\n\n")
-
-  # ----------------------------------------------------------------------------
-  # 6. Publication-Ready Feature Importance Plot
-  # ----------------------------------------------------------------------------
-  imp_scores <- importance(rf_model)
-  imp_df <- data.frame(
-    Variable   = names(imp_scores),
-    Importance = as.numeric(imp_scores)
-  ) %>% arrange(desc(Importance))
-  
-  p_imp <- ggplot(imp_df, aes(x = reorder(Variable, Importance), y = Importance)) +
-    geom_col(fill = "#2b5c8f", width = 0.7) +
-    geom_text(
-      aes(label = sprintf("%.2f%%", Importance * 100)),
-      hjust = -0.15, size = 3.5, fontface = "bold", color = "black"
-    ) +
-    scale_x_discrete(labels = variable_labels) +
-    scale_y_continuous(
-      limits = c(0, max(imp_df$Importance) * 1.25),
-      labels = percent_format(accuracy = 1),
-      expand = c(0, 0)
-    ) +
-    coord_flip() +
-    labs(
-      title = paste0("Feature Importance - ", stage_name),
-      x     = "Predictor Variables",
-      y     = "Mean Decrease in Accuracy (%)"
-    ) +
-    theme_minimal(base_size = 12) +
-    theme(
-      panel.grid.minor = element_blank(),
-      plot.title       = element_text(face = "bold", size = 13),
-      axis.title.x     = element_text(face = "bold", size = 11, margin = margin(t = 10)),
-      axis.title.y     = element_text(face = "bold", size = 11, margin = margin(r = 10)),
-      axis.text        = element_text(face = "bold", color = "black")
-    )
-  
-  # Display plot in R Markdown output
-  print(p_imp)
-  
-  # Save Importance Plot PNG
-  clean_stage_id <- gsub("[^A-Za-z0-9]", "_", stage_name)
-  ggsave(
-    filename = file.path(output_dir, paste0("Feature_Importance_", clean_stage_id, ".png")),
-    plot     = p_imp,
-    width    = 9, height = 5.5, dpi = 300, bg = "white"
-  )
-  
-  return(list(
-    model      = rf_model, 
-    roc        = roc_obj, 
-    moran      = moran_res, 
-    importance = imp_df
-  ))
+if (!dir.exists(OUTPUT_DIR)) {
+  dir.create(OUTPUT_DIR, recursive = TRUE)
 }
+
+figure_file <- file.path(
+  OUTPUT_DIR,
+  "GAM_standardized_coefficients_colour_by_stage.png"
+)
+
+if (file.exists(figure_file)) {
+  suffix <- 1L
+  repeat {
+    candidate_file <- file.path(
+      OUTPUT_DIR,
+      paste0("GAM_standardized_coefficients_colour_by_stage_", suffix, ".png")
+    )
+    if (!file.exists(candidate_file)) break
+    suffix <- suffix + 1L
+  }
+  figure_file <- candidate_file
+}
+
+ggsave(
+  filename = figure_file,
+  plot = coefficient_plot,
+  width = 11,
+  height = 7,
+  units = "in",
+  dpi = 300,
+  bg = "white"
+)
+
+cat("Figure saved to:", figure_file, "\n")
 ```
-
-4. EXECUTE MODELING PIPELINE FOR ALL CRIME STAGES
-
-```{r 04-run-all-stages, message=FALSE, warning=FALSE}
-# ==============================================================================
-# CHUNK 4: EXECUTE MODELING EVALUATION & IMPORTANCE FOR ALL STAGES
-# ==============================================================================
-
-input_dir_obj3 <- "C:/Users/eldayit/OneDrive - University of Maryland/Desktop/All files/Ventures/Pangolins_Gabon/Input/Objective_3"
-
-# Stage I (Pre-Activity)
-stage1_results <- run_crime_stage_rf(
-  stage_path       = file.path(input_dir_obj3, "Crime_stage_I.gpkg"),
-  stage_name       = "Stage I (Pre-Activity)",
-  covariates_stack = covariates
-)
-
-# Stage II (Activity)
-stage2_results <- run_crime_stage_rf(
-  stage_path       = file.path(input_dir_obj3, "Crime_stage_II.gpkg"),
-  stage_name       = "Stage II (Activity)",
-  covariates_stack = covariates
-)
-
-# Stage III (Post-Activity)
-stage3_results <- run_crime_stage_rf(
-  stage_path       = file.path(input_dir_obj3, "Crime_stage_III.gpkg"),
-  stage_name       = "Stage III (Post-Activity)",
-  covariates_stack = covariates
-)
-
-```
-
 
